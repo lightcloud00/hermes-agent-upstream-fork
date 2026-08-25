@@ -39,6 +39,10 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.openmaus_screenshot_compat import (
+    is_openmaus_screenshot_compat_enabled,
+    maybe_normalize_openmaus_screenshot_call,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -755,6 +759,10 @@ def _billing_failure_result(
         "failed": True,
         "error": summary,
         "failure_reason": classified.reason.value,
+        # The classifier's own retry verdict — carried so UI surfaces
+        # (agent/error_surface.py) show Retry only when a re-run can differ,
+        # instead of re-deriving retryability from a second taxonomy.
+        "failure_retryable": bool(classified.retryable),
         # The billing verdict may rest on an ambiguous body (#82154) — carry
         # that through the structured result, not just the prose.
         "billing_unverified": unverified,
@@ -1819,31 +1827,6 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
-
-    # If a background memory/skill review spawned at the end of a PRIOR turn
-    # (agent/background_review.py) is still running its own run_conversation()
-    # when THIS turn starts, cancel it now rather than letting both make
-    # outbound API calls concurrently against the same session_id/credentials.
-    # That concurrency can produce doubled prompt-token accounting on this
-    # turn's own calls and, because the review fork is a fully separate
-    # AIAgent with no route back to THIS agent's interrupt() by default, a
-    # lockup that survives a normal /stop and needs a hard Ctrl+C.
-    # ``review_agent.interrupt()`` is fire-and-forget here — it just flags
-    # cancellation and aborts the review's in-flight socket; it does not
-    # block waiting for the review's daemon thread to exit, so it can't add
-    # latency to this turn. Only ever set on the real owning agent (the
-    # review fork's own copy of this attribute stays None — reviews don't
-    # spawn nested reviews), so this is a no-op on every other run_conversation
-    # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
-    if _pending_review is not None:
-        try:
-            _pending_review.interrupt("superseded by a new live turn")
-        except Exception:
-            logger.debug(
-                "Failed to cancel in-flight background review for a new turn",
-                exc_info=True,
-            )
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -3076,10 +3059,15 @@ def run_conversation(
                         agent.thinking_callback("")
 
                 _use_streaming = True
+                # The opt-in OpenMaus screenshot compatibility parser consumes
+                # only a complete response. Never expose a partial pseudo-call
+                # as streamed assistant text before it has passed that parser.
+                if is_openmaus_screenshot_compat_enabled(agent):
+                    _use_streaming = False
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
+                elif getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable
@@ -6464,6 +6452,9 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        # The classifier's own retry verdict — UI surfaces use
+                        # this instead of re-deriving from the reason string.
+                        "failure_retryable": bool(classified.retryable),
                         # True when the billing verdict rests on an ambiguous
                         # body (#82154) — may be a content-filter rejection.
                         "billing_unverified": _billing_unverified,
@@ -6683,6 +6674,15 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            # One bound local model emits known screenshot requests as exact
+            # pseudo-call blocks. The opt-in parser converts only those
+            # read-only forms into the ordinary dispatch path; approvals, MCP
+            # execution, history, and ACP events remain unchanged.
+            if maybe_normalize_openmaus_screenshot_call(
+                agent, assistant_message, finish_reason, was_streaming=_use_streaming
+            ):
+                finish_reason = assistant_message.finish_reason
 
             try:
                 from hermes_cli.lifecycle import (
