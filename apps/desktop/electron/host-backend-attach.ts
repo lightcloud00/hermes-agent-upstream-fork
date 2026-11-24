@@ -6,7 +6,10 @@
 // WebSocket auth), and hold a host-level gate so two apps starting at once
 // produce one backend instead of two.
 //
-// Every dependency is injected so the ladder runs in a test without Electron.
+// Transport dependencies are injected so the ladder runs without Electron.
+
+import fs from 'node:fs'
+import path from 'node:path'
 
 import {
   classifyHostSpawnGate,
@@ -57,11 +60,11 @@ export interface HostBackendAttachDeps {
    */
   isPidAlive?: (pid: number) => boolean
   /**
-   * Commit this Desktop would spawn its own backend from (the checkout HEAD).
+   * Commit this Desktop would spawn its own backend from (Git HEAD or runtime stamp).
    * A backend that booted from other code — a CLI/launchd `hermes serve` that
    * outlived an update — answers 503 "Restart required" forever, and Restart
-   * would re-attach it, so it is skipped. Absent or null (packaged/non-git
-   * install): the token-only handshake, as before.
+   * would re-attach it, so it is skipped. Absent or null (unstamped install):
+   * the token-only handshake, as before.
    */
   expectedCodeIdentity?: () => Promise<string | null>
   /**
@@ -94,14 +97,31 @@ export async function fetchBackendCodeIdentity(baseUrl: string, timeoutMs = 3000
 /** A ready backend whose identity could not be read yet: neither attach nor spawn beside it. */
 const UNCONFIRMED = 'unconfirmed'
 
-/** The commit this Desktop would spawn its backend from: its checkout's HEAD, or null off git. */
+/** Identity follows the selected backend runtime, never an unrelated update checkout. */
 export async function checkoutHeadIdentity(
   root: string,
   isGitCheckout: (root: string) => boolean,
-  git: (args: string[], options: { cwd: string; timeoutMs: number }) => Promise<{ code: number | null; stdout: string }>
+  git: (
+    args: string[],
+    options: { cwd: string; timeoutMs: number }
+  ) => Promise<{ code: number | null; stdout: string }>,
+  overrideRoot?: string
 ): Promise<string | null> {
+  if (overrideRoot) {
+    root = path.resolve(overrideRoot)
+  }
+
   if (!isGitCheckout(root)) {
-    return null
+    // Archived runtimes have no Git metadata, but carry their exact build identity.
+    // Unstamped installs retain the existing authenticated compatibility handshake.
+    try {
+      const stamp: unknown = JSON.parse(fs.readFileSync(path.join(root, 'install-stamp.json'), 'utf8'))
+      const commit = stamp && typeof stamp === 'object' && 'commit' in stamp ? stamp.commit : null
+
+      return typeof commit === 'string' && /^[0-9a-f]{40}$/i.test(commit) ? commit : null
+    } catch {
+      return null
+    }
   }
 
   const head = await git(['rev-parse', 'HEAD'], { cwd: root, timeoutMs: 5000 })

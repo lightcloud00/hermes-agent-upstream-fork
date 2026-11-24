@@ -12725,15 +12725,15 @@ function attachToRunningHostBackend(): Promise<AttachedBackend | null> {
 
 function hostBackendAttachDeps() {
   return {
-    // Skip ledger records whose backend is already gone before dialling
-    // anything: the ledger survives the process it describes (#123586).
+    // Skip dead backends: the ledger survives its process (#123586).
     isPidAlive: isPidAliveWindows,
-    // Attach only to a backend booted from this checkout's HEAD: a CLI/launchd
-    // serve that outlived an update answers 503 "Restart required", and Restart
-    // would re-adopt the same stale process forever.
+    // Match the selected runtime so Restart cannot re-adopt stale code.
     expectedCodeIdentity: () =>
-      checkoutHeadIdentity(resolveUpdateRoot(), isGitCheckout, (args, options) =>
-        execGit(resolveGitBinary(), args, options)
+      checkoutHeadIdentity(
+        resolveUpdateRoot(),
+        isGitCheckout,
+        (args, options) => execGit(resolveGitBinary(), args, options),
+        process.env.HERMES_DESKTOP_HERMES_ROOT
       ),
     log: rememberLog,
     readLedger: (target: string) => {
